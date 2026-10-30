@@ -3,6 +3,12 @@ import shutil
 import numpy as np, tensorflow as tf
 from pathlib import Path
 
+def load_like_training(path):
+    """Load an image EXACTLY the way training did (image_dataset_from_directory): decode -> bilinear resize to 224x224."""
+    img = tf.io.decode_image(tf.io.read_file(str(path)), channels=3, expand_animations=False)
+    img = tf.image.resize(img, (224, 224))              # bilinear, same as training
+    return np.expand_dims(img.numpy().astype(np.float32), 0)
+
 labels = Path("model/labels.txt").read_text().splitlines()
 it = tf.lite.Interpreter(model_path="model/model.tflite"); it.allocate_tensors()
 inp, out = it.get_input_details()[0]["index"], it.get_output_details()[0]["index"]
@@ -13,7 +19,7 @@ if OUT.exists():
 wrong = 0
 for cls in labels:
     for f in sorted((Path("dataset/split/test") / cls).glob("*.*")):
-        x = np.expand_dims(np.array(tf.keras.utils.load_img(f, target_size=(224, 224)), dtype=np.float32), 0)
+        x = load_like_training(f)
         it.set_tensor(inp, x); it.invoke()
         probs = it.get_tensor(out)[0]
         pred = labels[int(np.argmax(probs))]

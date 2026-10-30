@@ -1,13 +1,32 @@
 """Train MobileNetV3-Small (ImageNet weights) in two phases: (1) train the new head, (2) fine-tune top layers.
-Preprocessing (0-255 -> model scale) is built into MobileNetV3, so the model takes RAW float32 pixels 0-255."""
+Preprocessing (0-255 -> model scale) is built into MobileNetV3, so the model takes RAW float32 RGB pixels 0-255.
+
+All extra "feature engineering" below is TRAINING-ONLY augmentation, so the exported TFLite model and the Pi code
+stay exactly the same (RGB, float32, 0-255, no /255). Each option can be switched off in the settings block."""
+import json
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
 from pathlib import Path
 
+# ----------------------------- settings -----------------------------
 IMG, BATCH, SEED = 224, 16, 42
 EPOCHS_HEAD, EPOCHS_FT, UNFREEZE_LAST = 15, 25, 30
-GRAY_PROB = 0.15   # share of TRAINING images randomly turned to grayscale (0.0 = off, for the baseline run)
+WEIGHTS = "imagenet"
+
+GRAY_PROB = 0.15          # share of training images turned to grayscale        (0.0 = off)
+BLUR_PROB = 0.25          # share of training images randomly blurred            (0.0 = off)  -> less reliance on sharpness
+BLUR_SIGMAS = (0.6, 1.0, 1.5)   # blur strengths picked at random per batch
+NOISE_STD = 4.0           # gaussian pixel noise (0-255 scale), 0.0 = off        -> less reliance on fine grain
+BRIGHTNESS = 0.25         # +/- brightness jitter (was 0.15)                     -> less reliance on lighting
+CONTRAST = 0.25           # +/- contrast jitter (was 0.15)
+USE_CLASS_WEIGHTS = True  # balance classes so the model is not pulled toward the biggest/"catch-all" class
+LABEL_SMOOTHING = 0.05    # softer labels: less overconfident wrong answers (0.0 = off)
+MONITOR = "val_loss"      # early stopping signal (steadier than val_accuracy on a small validation set)
+PATIENCE = 8
+# ---------------------------------------------------------------------
+
 Path("model").mkdir(exist_ok=True); Path("results").mkdir(exist_ok=True)
 tf.keras.utils.set_random_seed(SEED)
 
@@ -22,31 +41,55 @@ n_classes = len(class_names)
 print("Classes:", class_names)
 Path("model/labels.txt").write_text("\n".join(class_names))
 
-# Augmentation: training data only (kept out of the model so the exported TFLite stays clean)
+# class weights from the number of training images per class
+counts = np.array([len(list((Path("dataset/split/train") / c).glob("*.*"))) for c in class_names], dtype=float)
+class_weight = {i: float(counts.sum() / (n_classes * counts[i])) for i in range(n_classes)} if USE_CLASS_WEIGHTS else None
+print("Training images per class:", dict(zip(class_names, counts.astype(int))))
+print("Class weights:", {class_names[i]: round(w, 2) for i, w in class_weight.items()} if class_weight else "off")
+
+# ---------------- training-only augmentation ----------------
 augment = tf.keras.Sequential([
     tf.keras.layers.RandomFlip("horizontal_and_vertical"),
     tf.keras.layers.RandomRotation(0.08),
     tf.keras.layers.RandomZoom(0.1),
-    tf.keras.layers.RandomBrightness(0.15, value_range=(0, 255)),
-    tf.keras.layers.RandomContrast(0.15),
+    tf.keras.layers.RandomBrightness(BRIGHTNESS, value_range=(0, 255)),
+    tf.keras.layers.RandomContrast(CONTRAST),
 ])
 
+def _pick(x, y_new, p):
+    """For each image in the batch, use the changed version with probability p."""
+    use = tf.random.uniform([tf.shape(x)[0], 1, 1, 1]) < p
+    return tf.where(use, y_new, x)
+
 def random_gray(x, y):
-    """Randomly convert some training images to grayscale (kept as 3 channels, still 0-255).
-    Training only: the exported model and the Pi code still take normal RGB 0-255 images."""
     gray = tf.image.grayscale_to_rgb(tf.image.rgb_to_grayscale(x))
-    use = tf.random.uniform([tf.shape(x)[0], 1, 1, 1]) < GRAY_PROB
-    return tf.where(use, gray, x), y
+    return _pick(x, gray, GRAY_PROB), y
+
+def _gauss_kernel(sigma, size=7):
+    ax = tf.range(-(size // 2), size // 2 + 1, dtype=tf.float32)
+    g = tf.exp(-(ax ** 2) / (2.0 * sigma ** 2)); g = g / tf.reduce_sum(g)
+    k = g[:, None] * g[None, :]
+    return tf.tile(k[:, :, None, None], [1, 1, 3, 1])           # depthwise kernel (7,7,3,1)
+
+def random_blur(x, y):
+    sigma = tf.gather(tf.constant(BLUR_SIGMAS, tf.float32), tf.random.uniform([], 0, len(BLUR_SIGMAS), tf.int32))
+    blurred = tf.nn.depthwise_conv2d(x, _gauss_kernel(sigma), [1, 1, 1, 1], "SAME")
+    return _pick(x, blurred, BLUR_PROB), y
+
+def add_noise(x, y):
+    return tf.clip_by_value(x + tf.random.normal(tf.shape(x), stddev=NOISE_STD), 0.0, 255.0), y
 
 AUTOTUNE = tf.data.AUTOTUNE
 train_ds = train_ds.map(lambda x, y: (augment(x, training=True), y), num_parallel_calls=AUTOTUNE)
-if GRAY_PROB > 0:
-    train_ds = train_ds.map(random_gray, num_parallel_calls=AUTOTUNE)
+if GRAY_PROB > 0:  train_ds = train_ds.map(random_gray, num_parallel_calls=AUTOTUNE)
+if BLUR_PROB > 0:  train_ds = train_ds.map(random_blur, num_parallel_calls=AUTOTUNE)
+if NOISE_STD > 0:  train_ds = train_ds.map(add_noise, num_parallel_calls=AUTOTUNE)
 train_ds = train_ds.prefetch(AUTOTUNE)
 val_ds = val_ds.prefetch(AUTOTUNE)
 
+# ---------------- model ----------------
 base = tf.keras.applications.MobileNetV3Small(
-    input_shape=(IMG, IMG, 3), include_top=False, weights="imagenet",
+    input_shape=(IMG, IMG, 3), include_top=False, weights=WEIGHTS,
     pooling="avg", include_preprocessing=True)
 base.trainable = False
 inputs = tf.keras.Input((IMG, IMG, 3))
@@ -57,15 +100,16 @@ model = tf.keras.Model(inputs, outputs)
 
 def compile_(lr):
     model.compile(optimizer=tf.keras.optimizers.Adam(lr),
-                  loss="categorical_crossentropy", metrics=["accuracy"])
+                  loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+                  metrics=["accuracy"])
 
 def callbacks():
-    return [tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=6, restore_best_weights=True),
+    return [tf.keras.callbacks.EarlyStopping(monitor=MONITOR, patience=PATIENCE, restore_best_weights=True),
             tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-7)]
 
 print("\n=== Phase 1: training classifier head ===")
 compile_(1e-3)
-h1 = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_HEAD, callbacks=callbacks())
+h1 = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_HEAD, callbacks=callbacks(), class_weight=class_weight)
 
 print("\n=== Phase 2: fine-tuning top layers ===")
 base.trainable = True
@@ -75,7 +119,7 @@ for layer in base.layers:                       # keep BatchNorm statistics froz
     if isinstance(layer, tf.keras.layers.BatchNormalization):
         layer.trainable = False
 compile_(3e-5)
-h2 = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, callbacks=callbacks())
+h2 = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FT, callbacks=callbacks(), class_weight=class_weight)
 
 model.save("model/model.keras")
 print("\nSaved model/model.keras and model/labels.txt")
@@ -85,10 +129,21 @@ vacc = h1.history["val_accuracy"] + h2.history["val_accuracy"]
 loss = h1.history["loss"] + h2.history["loss"]
 vloss = h1.history["val_loss"] + h2.history["val_loss"]
 split = len(h1.history["accuracy"])
-fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-for a, (t, v, name) in zip(ax, [(acc, vacc, "Accuracy"), (loss, vloss, "Loss")]):
-    a.plot(t, label="train"); a.plot(v, label="validation")
-    a.axvline(split - 0.5, ls="--", c="gray", label="fine-tune starts")
-    a.set_title(name); a.set_xlabel("epoch"); a.legend()
-plt.tight_layout(); plt.savefig("results/training_curves.png", dpi=150)
-print(f"Best validation accuracy: {max(vacc):.4f}")
+
+# save the history first, so it is never lost even if plotting fails
+Path("results/training_history.json").write_text(json.dumps(
+    {"accuracy": acc, "val_accuracy": vacc, "loss": loss, "val_loss": vloss, "phase1_epochs": split,
+     "phase2_epochs": len(acc) - split}, indent=1))
+print(f"Epochs run: phase 1 = {split}, phase 2 = {len(acc) - split}, total = {len(acc)}")
+
+try:
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    for a, (t, v, name) in zip(ax, [(acc, vacc, "Accuracy"), (loss, vloss, "Loss")]):
+        a.plot(t, label="train"); a.plot(v, label="validation")
+        a.axvline(split - 0.5, ls="--", c="gray", label="fine-tune starts")
+        a.set_title(name); a.set_xlabel("epoch"); a.legend()
+    plt.tight_layout(); plt.savefig("results/training_curves.png", dpi=150)
+except Exception as e:
+    print("WARNING: could not save results/training_curves.png:", e,
+          "\n         (the model is saved; close any image viewer showing that file and delete it, then re-run only if you need the plot)")
+print(f"Best validation accuracy: {max(vacc):.4f}   lowest validation loss: {min(vloss):.4f}")
